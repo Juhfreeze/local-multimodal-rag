@@ -216,3 +216,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ==============================
+# JD_RAG local/private files
+# ==============================
+
+# User documents
+my_notes/
+
+# Local Chroma vector database
+chroma_db/
+
+# Local indexing manifest
+indexed_files.json
+
+# macOS
+.DS_Store
+
+# Local archives
+*.zip
+
+.idea/
+.vscode/
