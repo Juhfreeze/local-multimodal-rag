@@ -138,7 +138,7 @@ class DocumentProcessor:
             # SmartArt can be exposed as an unclassified graphic frame by python-pptx.
             # Inspect its DrawingML payload rather than counting table frames as visuals.
             for element in shape.element.iter():
-                if element.tag.rsplit("}", 1)[-1] in {"relIds", "oleObj"}:
+                if element.tag.rsplit("}", 1)[-1] in {"pic", "relIds", "oleObj"}:
                     return True
         return False
 
@@ -200,8 +200,10 @@ class DocumentProcessor:
         images = self.render_slides_to_images(path) if self.settings.render_full_slides and any(needs_vision) else []
         if images:
             self.report("  Full-slide rendering enabled (including native charts/equations).")
-        else:
+        elif any(needs_vision):
             self.report("  Embedded-picture fallback (native drawings may not be visible to Granite).")
+        else:
+            self.report("  No slide visuals detected; skipping slide rendering and Granite.")
         output = []
         visuals = 0
         for slide_num, slide in enumerate(slides, 1):
@@ -240,7 +242,7 @@ class DocumentProcessor:
                 for shape in self.iter_slide_shapes(slide.shapes):
                     if visuals >= self.settings.max_visuals_per_file:
                         break
-                    if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
+                    if not hasattr(shape, "image"):
                         continue
                     self.report(f"  Granite: {path.name}, slide {slide_num}, embedded picture")
                     description = self.describe_image(shape.image.blob,
