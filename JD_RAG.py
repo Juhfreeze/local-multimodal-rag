@@ -37,7 +37,7 @@ RETRIEVAL_K = 4
 PIPELINE_VERSION = "docling-granite-v1"  # Change => rebuild index
 SUPPORTED = {".txt", ".md", ".pdf", ".pptx", ".docx"}
 
-# When LibreOffice and PyMuPDF are available, send full slides to Granite.
+# When LibreOffice and PyMuPDF are available, send visually meaningful slides to Granite.
 # Otherwise, send embedded pictures (and extract native chart data as text).
 RENDER_FULL_SLIDES = True
 MAX_VISUALS_PER_FILE = 80  # Reduce for very image-heavy documents.
@@ -98,7 +98,8 @@ def get_converter():
     print("  Loading Docling (first PDF/DOCX of this update)...", flush=True)
     options = PdfPipelineOptions()
     options.do_ocr = True
-    options.generate_page_images = True
+    options.ocr_options.force_full_page_ocr = False
+    options.generate_page_images = False
     options.generate_picture_images = True
     options.images_scale = 1.5
     return DocumentConverter(
@@ -179,6 +180,35 @@ def docling_figures(doc, source: str, filename: str, max_figures: int):
 
 
 # -------------------- POWERPOINT VISUALS --------------------
+def iter_slide_shapes(shapes):
+    """Visit group contents as well as ordinary slide shapes."""
+    for shape in shapes:
+        yield shape
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            yield from iter_slide_shapes(shape.shapes)
+
+
+def slide_needs_vision(slide) -> bool:
+    """Detect visual objects without treating text/table-only groups as visuals."""
+    visual_types = {
+        MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.LINKED_PICTURE,
+        MSO_SHAPE_TYPE.CHART, MSO_SHAPE_TYPE.DIAGRAM,
+        MSO_SHAPE_TYPE.IGX_GRAPHIC, MSO_SHAPE_TYPE.EMBEDDED_OLE_OBJECT,
+        MSO_SHAPE_TYPE.LINKED_OLE_OBJECT,
+        MSO_SHAPE_TYPE.AUTO_SHAPE, MSO_SHAPE_TYPE.FREEFORM,
+        MSO_SHAPE_TYPE.LINE,
+    }
+    for shape in iter_slide_shapes(slide.shapes):
+        if getattr(shape, "has_chart", False) or shape.shape_type in visual_types:
+            return True
+        # SmartArt can be exposed as an unclassified graphic frame by python-pptx.
+        # Inspect its DrawingML payload rather than counting table frames as visuals.
+        for element in shape.element.iter():
+            if element.tag.rsplit("}", 1)[-1] in {"relIds", "oleObj"}:
+                return True
+    return False
+
+
 def render_slides_to_images(path: Path) -> list[Image.Image]:
     """Optional whole-slide rendering (requires LibreOffice and pymupdf)."""
     soffice = shutil.which("soffice") or "/Applications/LibreOffice.app/Contents/MacOS/soffice"
@@ -211,7 +241,7 @@ def render_slides_to_images(path: Path) -> list[Image.Image]:
 def native_chart_text(slide) -> list[str]:
     """Extract native PowerPoint chart values even without slide rendering."""
     items = []
-    for shape in slide.shapes:
+    for shape in iter_slide_shapes(slide.shapes):
         if not getattr(shape, "has_chart", False):
             continue
         try:
@@ -235,7 +265,8 @@ def pptx_content(path: Path, source: str) -> list[Document]:
     """Preserve slide-level citations and send slide visuals to Granite."""
     presentation = Presentation(str(path))
     slides = list(presentation.slides)
-    images = render_slides_to_images(path) if RENDER_FULL_SLIDES else []
+    needs_vision = [slide_needs_vision(slide) for slide in slides]
+    images = render_slides_to_images(path) if RENDER_FULL_SLIDES and any(needs_vision) else []
     if images:
         print("  Full-slide rendering enabled (including native charts/equations).")
     else:
@@ -244,7 +275,7 @@ def pptx_content(path: Path, source: str) -> list[Document]:
     visuals = 0
     for slide_num, slide in enumerate(slides, 1):
         text_parts = []
-        for shape in slide.shapes:
+        for shape in iter_slide_shapes(slide.shapes):
             if shape.has_text_frame and shape.text.strip():
                 text_parts.append(shape.text)
             if shape.has_table:
@@ -257,6 +288,9 @@ def pptx_content(path: Path, source: str) -> list[Document]:
                 page_content=nearby,
                 metadata={"source": source, "slide": slide_num, "type": "slide_text"}
             ))
+        if not needs_vision[slide_num - 1]:
+            print(f"  Skipping Granite: {path.name}, slide {slide_num} (text/table only)")
+            continue
         if images and slide_num <= len(images):
             if visuals >= MAX_VISUALS_PER_FILE:
                 print("  Visual limit reached; remaining visuals not analyzed.")
@@ -272,7 +306,7 @@ def pptx_content(path: Path, source: str) -> list[Document]:
                     metadata={"source": source, "slide": slide_num, "type": "visual"}
                 ))
         elif not images:
-            for shape in slide.shapes:
+            for shape in iter_slide_shapes(slide.shapes):
                 if visuals >= MAX_VISUALS_PER_FILE:
                     break
                 if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
@@ -407,6 +441,63 @@ def update_and_unload(db: Chroma) -> None:
 
 
 # -------------------- CHAT --------------------
+def choose_llm_model() -> str:
+    """Choose an installed chat model without downloading or loading one."""
+    def field(value, name, default=None):
+        return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+    def base_name(name):
+        return name.rsplit("/", 1)[-1].split(":", 1)[0]
+
+    try:
+        response = ollama.list()
+        names = sorted({
+            name for model in field(response, "models", [])
+            if isinstance(name := field(model, "model") or field(model, "name"), str) and name
+        })
+        excluded = {base_name(EMBED_MODEL), base_name(VISION_MODEL)}
+        chat_models = []
+        for name in names:
+            if base_name(name) in excluded:
+                continue
+            try:
+                capabilities = field(ollama.show(name), "capabilities")
+            except Exception:
+                capabilities = None  # Older Ollama servers may not expose capabilities.
+            if capabilities is not None and "completion" not in capabilities:
+                continue
+            chat_models.append(name)
+    except Exception as exc:
+        print(f"\nCould not read Ollama model list: {exc}")
+        print(f"Using default model: {LLM_MODEL}")
+        return LLM_MODEL
+
+    if not chat_models:
+        print(f"\nNo selectable chat models found. Using default: {LLM_MODEL}")
+        return LLM_MODEL
+
+    default_model = LLM_MODEL if LLM_MODEL in chat_models else chat_models[0]
+    print("\nAVAILABLE CHAT MODELS")
+    for number, model in enumerate(chat_models, 1):
+        marker = "  [default]" if model == default_model else ""
+        print(f"{number}. {model}{marker}")
+    while True:
+        try:
+            choice = input(f"Choose model number/name [Enter = {default_model}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\nUsing default model: {default_model}")
+            return default_model
+        if not choice:
+            return default_model
+        if choice in chat_models:
+            return choice
+        if choice.isdecimal() and len(choice) < 10:
+            index = int(choice) - 1
+            if 0 <= index < len(chat_models):
+                return chat_models[index]
+        print("Invalid selection. Enter a listed number/name, or press Enter for the default.")
+
+
 def main() -> None:
     NOTES_DIR.mkdir(parents=True, exist_ok=True)
     db_exists = DB_DIR.exists() and any(DB_DIR.iterdir())
@@ -441,8 +532,11 @@ def main() -> None:
     else:
         print("Skipping document processing; starting chat with the existing index.")
 
-    print(f"\nJD_RAG ready. Indexed chunks: {db._collection.count()}")
-    llm = ChatOllama(model=LLM_MODEL, temperature=0, num_ctx=8192)
+    selected_model = choose_llm_model()
+    llm = ChatOllama(model=selected_model, temperature=0, num_ctx=8192)
+    print(f"\nJD_RAG 0.2.0 ready. Indexed chunks: {db._collection.count()}")
+    print(f"Chat model: {selected_model}")
+    print(f"Embedding model: {EMBED_MODEL}")
     prompt = ChatPromptTemplate.from_messages([
         ("system",
          "Answer using ONLY the retrieved document context. If the information is "
@@ -484,7 +578,7 @@ def main() -> None:
                 "context": "\n\n---\n\n".join(context_parts), "question": question
             })
             response = llm.invoke(message)
-            print(f"\nQwen: {response.content}")
+            print(f"\n{selected_model}: {response.content}")
             print("\nRetrieved sources:")
             seen = set()
             for doc in docs:
