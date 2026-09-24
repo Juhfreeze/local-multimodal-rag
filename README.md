@@ -192,7 +192,7 @@ JD_RAG/
 └── indexed_files.json  # Local indexing manifest
 ```
 
-The final four local/generated items should not be committed to the repository.
+The following local/generated items should not be committed to the repository:
 
 ---
 
