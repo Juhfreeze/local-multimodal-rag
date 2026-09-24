@@ -1,0 +1,11 @@
+docling
+pillow
+ollama
+pymupdf
+langchain-core
+langchain-community
+langchain-ollama
+langchain-chroma
+langchain-text-splitters
+python-pptx
+python-docx
